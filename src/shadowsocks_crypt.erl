@@ -48,7 +48,8 @@ encode(#cipher_info{method=rc4_md5, stream_enc_state=S}=CipherInfo, Data) ->
     {S1, EncData} = crypto:stream_encrypt(S, Data),
     {CipherInfo#cipher_info{stream_enc_state=S1}, EncData};
 %% aes_128_cfb | aes_192_cfb | aes_256_cfb 
-encode(#cipher_info{method=_Method, key=Key, encode_iv=Iv, enc_rest=Rest}=CipherInfo, Data) ->
+encode(#cipher_info{method=_Method, key=Key, encode_iv=Iv, enc_rest=Rest}=CipherInfo, IoData) ->
+    Data = iolist_to_binary(IoData),
     DataSize = size(Data),
     RestSize = size(Rest),
     BufLen = (DataSize+RestSize) div 16 * 16,
@@ -91,7 +92,8 @@ decode(#cipher_info{method=rc4_md5, stream_dec_state=S}=CipherInfo, EncData) ->
     {CipherInfo#cipher_info{stream_dec_state=S1}, Data};
 
 %% aes_128_cfb | aes_192_cfb | aes_256_cfb 
-decode(#cipher_info{method=_Method, key=Key, decode_iv=Iv, dec_rest=Rest}=CipherInfo, EncData) ->
+decode(#cipher_info{method=_Method, key=Key, decode_iv=Iv, dec_rest=Rest}=CipherInfo, EncIoData) ->
+    EncData = iolist_to_binary(EncIoData),
     DataSize = size(EncData),
     RestSize = size(Rest),
     BufLen = (DataSize+RestSize) div 16 * 16,
