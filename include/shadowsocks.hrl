@@ -36,6 +36,9 @@
 -define(HMAC_LEN, 10).
 -define(OTA_HEAD_LEN, 12).
 
+-define(AEAD_TAG_LEN, 16).
+-define(AEAD_NONCE_LEN, 12).
+
 %% cipher info
 -record(cipher_info, {
           method=rc4_md5,      %% rc4_md5 | aes_128_cfb | des_cfb | aes_192_cfb | aes_256_cfb
@@ -46,7 +49,7 @@
           stream_enc_state,    %% used in AES CTR and RC4 mode
           stream_dec_state,     %% used in AES CTR and RC4 mode
           enc_rest = <<>>,
-          dec_rest = <<>>
+          dec_rest = {<<>>, 0}
          }).
 
 

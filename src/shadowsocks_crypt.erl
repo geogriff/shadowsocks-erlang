@@ -6,7 +6,14 @@
 -include("shadowsocks.hrl").
 
 methods() ->
-    [rc4_md5, aes_128_cfb, aes_192_cfb, aes_256_cfb, none].
+    [rc4_md5, aes_128_cfb, aes_192_cfb, aes_256_cfb, aead_aes_128_gcm, aead_aes_192_gcm, aead_aes_256_gcm, none].
+
+-record(aead_state, {
+          method :: aes_gcm,
+          key :: binary(),
+          ctr = 0 :: non_neg_integer(),
+          chunk :: {ChunkType :: frame_len | frame_data, ChunkLen :: non_neg_integer()}
+         }).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -42,13 +49,18 @@ encode(#cipher_info{method=none}, Data) ->
 encode(#cipher_info{iv_sent = false, encode_iv=Iv}=CipherInfo, Data) ->
     NewCipherInfo = CipherInfo#cipher_info{iv_sent=true},
     {NewCipherInfo1, EncData} = encode(NewCipherInfo, Data), 
-    {NewCipherInfo1, <<Iv/binary, EncData/binary>>};
+    {NewCipherInfo1, [Iv, EncData]};
 
 encode(#cipher_info{method=rc4_md5, stream_enc_state=S}=CipherInfo, Data) ->
     {S1, EncData} = crypto:stream_encrypt(S, Data),
     {CipherInfo#cipher_info{stream_enc_state=S1}, EncData};
-%% aes_128_cfb | aes_192_cfb | aes_256_cfb 
-encode(#cipher_info{method=_Method, key=Key, encode_iv=Iv, enc_rest=Rest}=CipherInfo, IoData) ->
+
+encode(#cipher_info{stream_enc_state=(#aead_state{}=State)}=CipherInfo, Data) ->
+    {NewState, ResData} = encode_aead(State, Data, iolist_size(Data), []),
+    {CipherInfo#cipher_info{stream_enc_state=NewState}, ResData};
+
+encode(#cipher_info{method=Method, key=Key, encode_iv=Iv, enc_rest=Rest}=CipherInfo, IoData)
+  when Method =:= aes_128_cfb; Method =:= aes_192_cfb; Method =:= aes_256_cfb ->
     Data = iolist_to_binary(IoData),
     DataSize = size(Data),
     RestSize = size(Rest),
@@ -60,6 +72,22 @@ encode(#cipher_info{method=_Method, key=Key, encode_iv=Iv, enc_rest=Rest}=Cipher
     EncRest = crypto:block_encrypt(aes_cfb128, Key, NewIv, Rest2),
     Result = binary:part(<<EncData/binary, EncRest/binary>>, RestSize, DataSize),
     {CipherInfo#cipher_info{encode_iv=NewIv, enc_rest=Rest2}, Result}.
+
+encode_aead(State, _Data, Len, ResDataAcc) when Len =:= 0 ->
+    {State, ResDataAcc};
+encode_aead(State, Data, Len, ResDataAcc) ->
+    {ChunkData, ChunkLen, RestData} =
+        case Len of
+            _ when Len > 16#4000 ->
+                << LongChunkData:16#3FFF/binary, LongRestData/binary >> = iolist_to_binary(Data),
+                {LongChunkData, 16#3FFF, LongRestData};
+            _ ->
+                {Data, Len, undefined}
+        end,
+    #aead_state{method=Method, key=Key, ctr=Ctr}=State,
+    {EncLen, EncLenTag} = crypto:block_encrypt(Method, Key, aead_nonce(Ctr), {<<>>, << 0:2, Len:14 >>, ?AEAD_TAG_LEN}),
+    {EncData, EncDataTag} = crypto:block_encrypt(Method, Key, aead_nonce(Ctr+1), {<<>>, ChunkData, ?AEAD_TAG_LEN}),
+    encode_aead(State#aead_state{ctr=Ctr+2}, RestData, Len - ChunkLen, [ResDataAcc, EncLen, EncLenTag, EncData, EncDataTag]).
 
 
 %%--------------------------------------------------------------------
@@ -76,26 +104,29 @@ decode(#cipher_info{method=none}, Data) ->
     Data;
 
 %% recv iv
-decode(CipherInfo=#cipher_info{method=M, decode_iv=undefined, dec_rest=Rest}, EncData) ->
+decode(CipherInfo=#cipher_info{method=M, decode_iv=undefined, dec_rest={Rest, _RestSize}}, EncData) ->
     {_, IvLen} = key_iv_len(M),
     case <<Rest/binary, EncData/binary>> of
         Rest1 when byte_size(Rest1) >= IvLen ->
             <<Iv:IvLen/binary, Rest2/binary>> = Rest1,
             StreamState = shadowsocks_crypt:stream_init(M, CipherInfo#cipher_info.key, Iv),
-            decode(CipherInfo#cipher_info{decode_iv=Iv, stream_dec_state=StreamState, dec_rest= <<>>}, Rest2);
+            decode(CipherInfo#cipher_info{decode_iv=Iv, stream_dec_state=StreamState, dec_rest = {<<>>, 0}}, Rest2);
         Rest1 ->
-            {CipherInfo#cipher_info{dec_rest=Rest1}}
+            {CipherInfo#cipher_info{dec_rest={Rest1, byte_size(Rest1)}}}
     end;
 
 decode(#cipher_info{method=rc4_md5, stream_dec_state=S}=CipherInfo, EncData) ->
     {S1, Data} = crypto:stream_decrypt(S, EncData),
     {CipherInfo#cipher_info{stream_dec_state=S1}, Data};
 
-%% aes_128_cfb | aes_192_cfb | aes_256_cfb 
-decode(#cipher_info{method=_Method, key=Key, decode_iv=Iv, dec_rest=Rest}=CipherInfo, EncIoData) ->
+decode(#cipher_info{stream_dec_state=(#aead_state{}=State), dec_rest={Acc, AccSize}}=CipherInfo, Data) ->
+    {NewState, NewAccTuple, ResData} = decode_aead(State, [Acc, Data], AccSize + iolist_size(Data), <<>>),
+    {CipherInfo#cipher_info{stream_dec_state=NewState, dec_rest=NewAccTuple}, ResData};
+
+decode(#cipher_info{method=Method, key=Key, decode_iv=Iv, dec_rest={Rest, RestSize}}=CipherInfo, EncIoData)
+  when Method =:= aes_128_cfb; Method =:= aes_192_cfb; Method =:= aes_256_cfb ->
     EncData = iolist_to_binary(EncIoData),
     DataSize = size(EncData),
-    RestSize = size(Rest),
     BufLen = (DataSize+RestSize) div 16 * 16,
     <<EncData2:BufLen/binary, Rest2/binary>> = <<Rest/binary, EncData/binary>>,
 
@@ -104,7 +135,28 @@ decode(#cipher_info{method=_Method, key=Key, decode_iv=Iv, dec_rest=Rest}=Cipher
     DecRest = crypto:block_decrypt(aes_cfb128, Key, NewIv, Rest2),
     Result = binary:part(<<Data/binary, DecRest/binary>>, RestSize, DataSize),
 
-    {CipherInfo#cipher_info{decode_iv=NewIv, dec_rest=Rest2}, Result}.
+    {CipherInfo#cipher_info{decode_iv=NewIv, dec_rest={Rest2, byte_size(Rest2)}}, Result}.
+
+decode_aead(#aead_state{chunk={_, ChunkDataSize}}=State, Acc, AccSize, ResDataAcc)
+  when AccSize < (ChunkDataSize + ?AEAD_TAG_LEN) ->
+    {State, {Acc, AccSize},  ResDataAcc};
+
+decode_aead(State, Acc, _AccSize, ResDataAcc) ->
+    #aead_state{key=Key, ctr=Ctr, chunk={_, ChunkDataSize}} = State,
+    << EncChunkData:ChunkDataSize/binary, ChunkTag:?AEAD_TAG_LEN/binary, NewAcc/binary >> = iolist_to_binary(Acc),
+    case crypto:block_decrypt(aes_gcm, Key, aead_nonce(Ctr), {<<>>, EncChunkData, ChunkTag}) of
+        error ->
+            exit(decrypt_error);
+        ChunkData ->
+            {NewState, ResData} = decode_aead_chunk(State#aead_state{ctr=Ctr+1}, ChunkData),
+            decode_aead(NewState, NewAcc, byte_size(NewAcc), [ResDataAcc, ResData])
+    end.
+
+decode_aead_chunk(#aead_state{chunk={frame_len, _}}=State, ChunkData) ->
+    << 0:2, FrameDataSize:14 >> = ChunkData,
+    {State#aead_state{chunk={frame_data, FrameDataSize}}, <<>>};
+decode_aead_chunk(#aead_state{chunk={frame_data, _}}=State, ChunkData) ->
+    {State#aead_state{chunk={frame_len, 2}}, ChunkData}.
 
 hmac(Key, Data) ->
     crypto:hmac(sha, Key, Data, ?HMAC_LEN).
@@ -130,11 +182,19 @@ evp_bytestokey_aux(Password, KeyLen, IvLen, Acc) ->
     NewAcc = <<Acc/binary, Digest/binary>>,
     evp_bytestokey_aux(Password, KeyLen, IvLen, NewAcc).
 
+aead_nonce(Ctr) when Ctr < (1 bsl (?AEAD_NONCE_LEN * 8)) ->
+    << Ctr:(?AEAD_NONCE_LEN * 8)/little >>.
 
 key_iv_len(none) ->
     {0, 0};
 key_iv_len(rc4_md5) ->
     {16, 16};
+key_iv_len(aead_aes_128_gcm) ->
+    {16, 16};
+key_iv_len(aead_aes_192_gcm) ->
+    {24, 24};
+key_iv_len(aead_aes_256_gcm) ->
+    {32, 32};
 key_iv_len(aes_128_cfb) ->
     {16, 16};
 key_iv_len(aes_192_cfb) ->
@@ -145,6 +205,10 @@ key_iv_len(chacha20) ->
     {32, 8}.
 
 
+stream_init(Method, Key, Iv)
+  when Method =:= aead_aes_128_gcm; Method =:= aead_aes_192_gcm; Method =:= aead_aes_256_gcm ->
+    AeadKey = hkdf:expand(sha, hkdf:extract(sha, Iv, Key), <<"ss-subkey">>, byte_size(Key)),
+    #aead_state{method=aes_gcm, key=AeadKey, ctr=0, chunk={frame_len, 2}};
 stream_init(rc4_md5, Key, Iv) ->
     crypto:stream_init(rc4, crypto:hash(md5, <<Key/binary, Iv/binary>>));
 stream_init(_, _, _) ->

@@ -375,7 +375,7 @@ recv_decode(Len, Data, State) when byte_size(Data) >= Len ->
 recv_decode(Len, Data, State = #state{csocket=Socket, cipher_info=CipherInfo}) ->
     Data1 = exactly_recv(Socket, 0),
     {CipherInfo1, Data2} = shadowsocks_crypt:decode(CipherInfo, Data1),
-    Data3 = <<Data/binary, Data2/binary>>,
+    Data3 = <<Data/binary, (iolist_to_binary(Data2))/binary>>,
     recv_decode(Len, Data3, State#state{cipher_info=CipherInfo1}).
 
 %% recv socks5 request
