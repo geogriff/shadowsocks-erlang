@@ -214,7 +214,7 @@ handle_info({inet_async, _LSocket, _Ref, {ok, CSocket}},
     case gen_tcp:controlling_process(CSocket, Pid) of
         ok ->
             gen_event:notify(?STAT_EVENT, {conn, open, Pid}),            
-            Pid ! {shoot, CSocket};
+            sserl_conn:shoot(Pid, CSocket);
         {error, _} ->
             exit(Pid, kill),
             gen_tcp:close(CSocket)

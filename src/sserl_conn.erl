@@ -11,7 +11,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2, init/2]).
+-export([start_link/2, shoot/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -60,18 +60,18 @@
 %% @end
 %%--------------------------------------------------------------------
 start_link(Socket, Info) ->
-    proc_lib:start_link(?MODULE, init, [Socket, Info]).
-    %% gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start_link(?MODULE, [Socket, Info], []).
+
+shoot(Pid, CSocket) ->
+    gen_server:cast(Pid, {shoot, CSocket}).
 
 init(Socket, {Port, Server, OTA, Type, {Method,Password}}) ->
-    proc_lib:init_ack({ok, self()}),
-    wait_socket(Socket),
     Cipher = shadowsocks_crypt:init_cipher_info(Method, Password),
     State = #state{csocket=Socket, ssocket=undefined, 
                    ota=OTA, port=Port, type=Type,
                    target = Server,
                    cipher_info=Cipher},
-    init_proto(State).
+    State.
 
 
 init_proto(State=#state{type=server,csocket=CSocket}) ->
@@ -83,7 +83,7 @@ init_proto(State=#state{type=server,csocket=CSocket}) ->
             self() ! {send, Data},
             inet:setopts(CSocket, [{active, once}]),
             erlang:send_after(?REPORT_INTERVAL, self(), report_flow),
-            gen_server:enter_loop(?MODULE, [], init_handler(State2#state{ssocket=SSocket,target={Addr,Port}}));
+            init_handler(State2#state{ssocket=SSocket,target={Addr,Port}});
         {error, Reason} ->
             exit(Reason)
     end;
@@ -104,7 +104,7 @@ init_proto(State=#state{type=client, csocket=CSocket, target={Addr,Port},ota=OTA
             ok = gen_tcp:send(SSocket, NewData),
             inet:setopts(CSocket, [{active, once}]),
             State1 = State#state{ssocket = SSocket, cipher_info=NewCipher, ota_iv=Cipher#cipher_info.encode_iv},
-            gen_server:enter_loop(?MODULE, [], init_handler(State1));
+            init_handler(State1);
         {error, Reason} ->
             exit(Reason)
     end.
@@ -137,8 +137,8 @@ init_handler(State=#state{type=server, ota=false}) ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([]) ->
-    {ok, #state{}}.
+init([Socket, Info]) ->
+    {ok, init(Socket, Info)}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -168,6 +168,9 @@ handle_call(_Request, _From, State) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
+handle_cast({shoot, CSocket}, State) ->
+    CSocket = State#state.csocket,
+    {noreply, init_proto(State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -314,15 +317,6 @@ handle_ota(State) ->
     {noreply, State}.
 
 %% ---------------------------------------------------------------------------------------------------------
-
-wait_socket(Socket) ->
-    receive
-        {shoot, Socket} ->
-            ok;
-        _ ->
-            wait_socket(Socket)
-    end.
-
 
 %% recv the iv data
 recv_ivec(State = #state{csocket=Socket, 
