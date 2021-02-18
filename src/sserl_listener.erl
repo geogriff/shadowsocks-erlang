@@ -202,9 +202,11 @@ handle_cast(_Msg, State) ->
 handle_info({timeout, _Ref, expire}, State) ->
     {stop, expire, State};
 
-handle_info({inet_async, _LSocket, _Ref, {ok, CSocket}}, 
+handle_info({inet_async, LSocket, _Ref, {ok, CSocket}},
             State=#state{ota=OTA, port=Port, type=Type, 
                          method=Method,password=Password, server=Server, conns=Conns}) ->
+    {ok, Opts} = inet:getopts(LSocket, [active, nodelay, keepalive, delay_send, priority, tos]),
+    ok = inet:setopts(CSocket, Opts),
     true = inet_db:register_socket(CSocket, inet_tcp), 
     {ok, {Addr, _}} = inet:peername(CSocket),
     gen_event:notify(?STAT_EVENT, {listener, accept, Port, Addr}),
