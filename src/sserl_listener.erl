@@ -21,6 +21,7 @@
 
 -define(SERVER, ?MODULE).
 -define(MAX_LIMIT, 16#0FFFFFFFFFFFFFFF).
+-define(TCP_FASTOPEN_QUEUE_LENGTH, 5).
 
 -record(state, {
           ota,          % one time auth
@@ -36,6 +37,9 @@
           type = server,
           server = undefined % server {address, port}
 }).
+
+-define(SOL_TCP, 6).
+-define(TCP_FASTOPEN_LINUX, 23).
 
 %%%===================================================================
 %%% API
@@ -124,6 +128,11 @@ init([State,IP]) ->
     %% start listen
     case gen_tcp:listen(State#state.port, Opts1) of
         {ok, LSocket} ->
+            %% try to enable TCP_FASTOPEN
+            case os:type() of
+                {unix, linux} -> catch inet:setopts(LSocket, [{raw, ?SOL_TCP, ?TCP_FASTOPEN_LINUX, <<?TCP_FASTOPEN_QUEUE_LENGTH:32/native>>}]);
+                _ -> ok
+            end,
             %% set to async accept, so we can do many things on this process
             case prim_inet:async_accept(LSocket, -1) of
                 {ok, _} ->
