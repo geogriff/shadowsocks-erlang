@@ -65,8 +65,8 @@ init([]) ->
 %%                          remove_handler
 %% @end
 %%--------------------------------------------------------------------
-handle_event(Event, State) ->
-    io:format("Event:~p~n", [Event]),
+handle_event(_Event, State) ->
+    %%io:format("Event:~p~n", [Event]),
     {ok, State}.
 
 %%--------------------------------------------------------------------
