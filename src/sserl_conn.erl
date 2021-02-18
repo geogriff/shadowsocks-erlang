@@ -79,36 +79,28 @@ init_proto(State=#state{type=server,csocket=CSocket}) ->
     State1 = recv_ivec(State),
     {Addr, Port, Data, State2} = recv_target(State1),
     gen_event:notify(?STAT_EVENT, {conn, connect, Addr, Port}),
-    case gen_tcp:connect(Addr, Port, ?TCP_OPTS) of
-        {ok, SSocket} ->
-            self() ! {send, Data},
-            inet:setopts(CSocket, [{active, once}]),
-            erlang:send_after(?REPORT_INTERVAL, self(), report_flow),
-            init_handler(State2#state{ssocket=SSocket,target={Addr,Port}});
-        {error, Reason} ->
-            exit(Reason)
-    end;
+    SSocket = connect(Addr, Port, ?TCP_OPTS),
+    self() ! {send, Data},
+    inet:setopts(CSocket, [{active, once}]),
+    erlang:send_after(?REPORT_INTERVAL, self(), report_flow),
+    init_handler(State2#state{ssocket=SSocket,target={Addr,Port}});
 
 init_proto(State=#state{type=client, csocket=CSocket, target={Addr,Port},ota=OTA,cipher_info=Cipher}) ->
     {Atype, Data} = recv_socks5(CSocket),
-    case gen_tcp:connect(Addr, Port, ?TCP_OPTS) of
-        {ok, SSocket} ->
-            {NewCipher, NewData} = 
-                case OTA of
-                    true ->
-                        Hmac = shadowsocks_crypt:hmac([Cipher#cipher_info.encode_iv, Cipher#cipher_info.key],
-                                                  [Atype bor ?OTA_FLAG, Data]),
-                        shadowsocks_crypt:encode(Cipher, [Atype bor ?OTA_FLAG, Data, Hmac]);
-                    false ->
-                        shadowsocks_crypt:encode(Cipher, [Atype, Data])
-                end,
-            ok = gen_tcp:send(SSocket, NewData),
-            inet:setopts(CSocket, [{active, once}]),
-            State1 = State#state{ssocket = SSocket, cipher_info=NewCipher, ota_iv=Cipher#cipher_info.encode_iv},
-            init_handler(State1);
-        {error, Reason} ->
-            exit(Reason)
-    end.
+    SSocket = connect(Addr, Port, ?TCP_OPTS),
+    {NewCipher, NewData} =
+        case OTA of
+            true ->
+                Hmac = shadowsocks_crypt:hmac([Cipher#cipher_info.encode_iv, Cipher#cipher_info.key],
+                                              [Atype bor ?OTA_FLAG, Data]),
+                shadowsocks_crypt:encode(Cipher, [Atype bor ?OTA_FLAG, Data, Hmac]);
+            false ->
+                shadowsocks_crypt:encode(Cipher, [Atype, Data])
+        end,
+    exactly_send(SSocket, NewData),
+    inet:setopts(CSocket, [{active, once}]),
+    State1 = State#state{ssocket = SSocket, cipher_info=NewCipher, ota_iv=Cipher#cipher_info.encode_iv},
+    init_handler(State1).
 
 init_handler(State=#state{type=client, ota=true}) ->
     State#state{c2s_handler=fun handle_client_ota_c2s/2,
@@ -171,7 +163,12 @@ handle_call(_Request, _From, State) ->
 %%--------------------------------------------------------------------
 handle_cast({shoot, CSocket}, State) ->
     CSocket = State#state.csocket,
-    {noreply, init_proto(State)};
+    try init_proto(State) of
+        NewState -> {noreply, NewState}
+    catch
+        _:econnrefused -> {stop, normal, State};
+        _:etimedout -> {stop, normal, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -323,7 +320,7 @@ handle_ota(State) ->
 recv_ivec(State = #state{csocket=Socket, 
                          cipher_info=#cipher_info{method=Method,key=Key}=CipherInfo}) ->
     {_, IvLen} = shadowsocks_crypt:key_iv_len(Method),
-    {ok, IvData} = gen_tcp:recv(Socket, IvLen, ?RECV_TIMOUT),
+    IvData = exactly_recv(Socket, IvLen),
     StreamState = shadowsocks_crypt:stream_init(Method, Key, IvData),
     State#state{
       ota_iv = IvData,
@@ -376,7 +373,7 @@ recv_target(State) ->
 recv_decode(Len, Data, State) when byte_size(Data) >= Len ->
     {Data, State};
 recv_decode(Len, Data, State = #state{csocket=Socket, cipher_info=CipherInfo}) ->
-    {ok, Data1} = gen_tcp:recv(Socket, 0, ?RECV_TIMOUT),
+    Data1 = exactly_recv(Socket, 0),
     {CipherInfo1, Data2} = shadowsocks_crypt:decode(CipherInfo, Data1),
     Data3 = <<Data/binary, Data2/binary>>,
     recv_decode(Len, Data3, State#state{cipher_info=CipherInfo1}).
@@ -389,7 +386,7 @@ recv_socks5(Socket) ->
     %% don't care methods
     _ = exactly_recv(Socket, NMethods),
     %% response ok
-    ok = gen_tcp:send(Socket, <<?SOCKS5_VER:8, 0>>),
+    exactly_send(Socket, <<?SOCKS5_VER:8, 0>>),
     
     %% ------ socks5 req -------------------------
     %% only support socks5 connect
@@ -398,18 +395,28 @@ recv_socks5(Socket) ->
               ?SOCKS5_ATYP_V4 ->
                   exactly_recv(Socket, 6);
               ?SOCKS5_ATYP_V6 ->
-                  exactly_recv(Socket, 18);   
+                  exactly_recv(Socket, 18);
               ?SOCKS5_ATYP_DOM ->
                   <<DomLen:8/big>> = exactly_recv(Socket, 1),
-                  [DomLen,exactly_recv(Socket, DomLen+2)]
+                  [DomLen, exactly_recv(Socket, DomLen+2)]
           end,
-    ok = gen_tcp:send(Socket, <<?SOCKS5_VER, ?SOCKS5_REP_OK, 0, ?SOCKS5_ATYP_V4, 0:32,0:16>>),
+    exactly_send(Socket, <<?SOCKS5_VER, ?SOCKS5_REP_OK, 0, ?SOCKS5_ATYP_V4, 0:32,0:16>>),
     {Atyp,Ret}.
                            
-
-exactly_recv(Socket, Size) ->
-    {ok, Ret} = gen_tcp:recv(Socket, Size, ?RECV_TIMOUT),
-    Ret.
+connect(Addr, Port, Opts) ->
+    exactly(fun gen_tcp:connect/3, [Addr, Port, Opts]).
+exactly_send(Socket, Data) ->
+    exactly(fun gen_tcp:send/2, [Socket, Data]).
+exactly_recv(Socket, Data) ->
+    exactly(fun gen_tcp:recv/3, [Socket, Data, ?RECV_TIMOUT]).
+exactly(Fun, Args) ->
+    try apply(Fun, Args) of
+        ok           -> ok;
+        {ok, Res}    -> Res;
+        {error, Err} -> exit(Err)
+    catch
+        _:CaughtErr  -> exit(CaughtErr)
+    end.
 
 %% try to send package
 %% return 1 if success else return 0
