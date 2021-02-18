@@ -75,6 +75,7 @@ init(Socket, {Port, Server, OTA, Type, {Method,Password}}) ->
 
 
 init_proto(State=#state{type=server,csocket=CSocket}) ->
+    ok = inet:setopts(CSocket, [{keepalive, true}]),
     State1 = recv_ivec(State),
     {Addr, Port, Data, State2} = recv_target(State1),
     gen_event:notify(?STAT_EVENT, {conn, connect, Addr, Port}),
